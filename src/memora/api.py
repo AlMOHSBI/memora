@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from .config import get_settings
+from .db import Database
+from .providers import build_summarizer, ProviderError
+from .service import MemoryService
+
+
+settings = get_settings()
+db = Database(settings.database_path)
+service: MemoryService | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global service
+    db.initialize()
+    service = MemoryService(db, build_summarizer(settings))
+    yield
+
+
+app = FastAPI(
+    title="Memora API",
+    version="0.1.0",
+    description="Local-first persistent memory API for AI agents.",
+    lifespan=lifespan,
+)
+
+
+def get_service() -> MemoryService:
+    if service is None:
+        raise HTTPException(503, "Memora is starting.")
+    return service
+
+
+class EventIn(BaseModel):
+    agent: str = Field(min_length=1, max_length=100)
+    project: str | None = None
+    session_id: str | None = None
+    content: str = Field(min_length=1, max_length=50000)
+    event_type: str = "note"
+    metadata: dict = Field(default_factory=dict)
+
+
+class MemoryIn(BaseModel):
+    content: str = Field(min_length=1, max_length=50000)
+    project: str | None = None
+    memory_type: str = "fact"
+    importance: float = Field(default=0.5, ge=0, le=1)
+    tags: list[str] = Field(default_factory=list)
+    source: str = "api"
+    summary: str | None = None
+
+
+class SessionIn(BaseModel):
+    agent: str = "generic"
+    project: str | None = None
+    external_id: str | None = None
+    title: str | None = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "memora", "version": "0.1.0"}
+
+
+@app.post("/v1/sessions")
+def create_session(body: SessionIn):
+    svc = get_service()
+    return {"session_id": svc.start_session(body.agent, body.project, body.external_id, body.title)}
+
+
+@app.post("/v1/events")
+def create_event(body: EventIn):
+    svc = get_service()
+    try:
+        session_id = body.session_id or svc.start_session(body.agent, body.project)
+        event_id = svc.add_event(session_id, body.content, body.event_type, body.metadata)
+        return {"event_id": event_id, "session_id": session_id}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/v1/memories")
+def create_memory(body: MemoryIn):
+    try:
+        memory_id = get_service().add_memory(
+            body.content, body.project, body.memory_type, body.importance,
+            body.tags, body.source, summary=body.summary
+        )
+        return {"memory_id": memory_id}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+
+@app.get("/v1/memories")
+def list_memories(project: str | None = None,
+                  limit: int = Query(default=100, ge=1, le=500)):
+    return {"results": get_service().list_memories(project, limit)}
+
+
+@app.patch("/v1/memories/{memory_id}")
+def update_memory(memory_id: str, body: MemoryIn):
+    try:
+        updated = get_service().update_memory(
+            memory_id, body.content, body.summary
+        )
+        if not updated:
+            raise HTTPException(404, "Memory not found.")
+        return {"updated": True, "memory_id": memory_id}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/v1/memories/search")
+def search_memories(q: str = Query(min_length=1), project: str | None = None,
+                    limit: int = Query(default=10, ge=1, le=100)):
+    return {"results": get_service().search(q, project, limit)}
+
+
+@app.get("/v1/context")
+def get_context(project: str | None = None, q: str = "recent project decisions",
+                limit: int = Query(default=8, ge=1, le=30)):
+    return {"context": get_service().session_context(project, q, limit)}
+
+
+@app.post("/v1/sessions/{session_id}/summarize")
+async def summarize_session(session_id: str):
+    try:
+        memory_id, summary = await get_service().summarize_session(session_id)
+        return {"memory_id": memory_id, "summary": summary}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ProviderError as exc:
+        raise HTTPException(502, str(exc)) from exc
